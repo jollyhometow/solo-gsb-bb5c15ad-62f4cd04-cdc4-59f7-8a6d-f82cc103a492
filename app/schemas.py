@@ -161,6 +161,42 @@ class TimelineOut(BaseModel):
     points: list[TimelinePointOut]
 
 
+ExcursionDimension = Literal["temperature", "humidity"]
+
+
+class ExcursionEventOut(BaseModel):
+    start_ts: dt.datetime
+    end_ts: dt.datetime
+    dimensions: list[ExcursionDimension] = Field(
+        ..., description="触发该事件的维度（temperature 在前，可多个）"
+    )
+    duration_seconds: float = Field(..., description="事件持续秒数")
+    temp_dose: float = Field(..., description="事件内温度越界剂量（°C·秒）")
+    humidity_dose: float = Field(..., description="事件内湿度越界剂量（%RH·秒）")
+    peak_temperature: float | None = Field(
+        None, description="温度峰值：越界幅度最大处的温度（未触发温度时为 null）"
+    )
+    peak_temperature_ts: dt.datetime | None = None
+    peak_humidity: float | None = Field(
+        None, description="湿度峰值：越界幅度最大处的湿度（未触发湿度时为 null）"
+    )
+    peak_humidity_ts: dt.datetime | None = None
+
+
+class ExcursionsOut(BaseModel):
+    device_sn: str
+    start: dt.datetime | None = Field(None, description="实际生效的起始过滤（UTC），未指定为 null")
+    end: dt.datetime | None = Field(None, description="实际生效的结束过滤（UTC），未指定为 null")
+    max_gap_seconds: float = Field(..., description="生效的最大采样间隔（秒）")
+    temp_min: float | None = None
+    temp_max: float | None = None
+    humidity_min: float | None = None
+    humidity_max: float | None = None
+    sample_count: int = Field(..., description="过滤后参与计算的读数数量")
+    event_count: int
+    events: list[ExcursionEventOut]
+
+
 class HealthOut(BaseModel):
     status: str
     db: str

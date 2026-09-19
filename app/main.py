@@ -12,11 +12,13 @@ from sqlalchemy.orm import Session
 
 from . import services
 from .database import CaseState, SessionLocal, init_db, to_utc
+from .excursions import Thresholds
 from .schemas import (
     AnchorIn,
     AnchorOut,
     BatchIngest,
     CaseOut,
+    ExcursionsOut,
     HealthOut,
     IngestResponse,
     IngestSummary,
@@ -48,9 +50,10 @@ app = FastAPI(
     description=(
         "接收带设备序号与时间戳的温湿度读数，按惩罚项对每个展柜执行"
         "确定性变点分段；合并同序号重复上报，支持迟到读数补入后的"
-        "时间线重放、锚点校准与无写库重放预览。"
+        "时间线重放、锚点校准与无写库重放预览；并提供基于线性插值的"
+        "越界剂量（excursion dose）事件查询。"
     ),
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -218,6 +221,54 @@ def get_timeline(
     if timeline is None:
         raise HTTPException(status_code=404, detail="展柜不存在或尚无读数")
     return timeline
+
+
+@app.get(
+    "/api/v1/cases/{device_sn}/excursions",
+    response_model=ExcursionsOut,
+    tags=["cases"],
+    summary="越界剂量查询：线性插值阈值交点 + 分维剂量积分 + 事件合并",
+)
+def get_excursions(
+    device_sn: str,
+    start: dt.datetime | None = Query(None, description="起始时间（含），ISO8601"),
+    end: dt.datetime | None = Query(None, description="结束时间（含），ISO8601"),
+    temp_min: float | None = Query(None, ge=-50.0, le=100.0, description="温度下限（°C）"),
+    temp_max: float | None = Query(None, ge=-50.0, le=100.0, description="温度上限（°C）"),
+    humidity_min: float | None = Query(None, ge=0.0, le=100.0, description="湿度下限（%RH）"),
+    humidity_max: float | None = Query(None, ge=0.0, le=100.0, description="湿度上限（%RH）"),
+    max_gap: float = Query(
+        600.0,
+        gt=0.0,
+        le=86400.0,
+        description="允许的最大采样间隔（秒）；超过则曲线断开，未知区间不计剂量",
+    ),
+    db: Session = Depends(get_db),
+):
+    start_utc = _parse_ts(start)
+    end_utc = _parse_ts(end)
+    if start_utc is not None and end_utc is not None and start_utc > end_utc:
+        raise HTTPException(status_code=422, detail="start 不能晚于 end")
+
+    thresholds = Thresholds(
+        temp_min=temp_min,
+        temp_max=temp_max,
+        humidity_min=humidity_min,
+        humidity_max=humidity_max,
+    )
+    if not thresholds.configured():
+        raise HTTPException(status_code=422, detail="至少配置一个温度或湿度上下限")
+    if temp_min is not None and temp_max is not None and temp_min > temp_max:
+        raise HTTPException(status_code=422, detail="temp_min 不能大于 temp_max")
+    if humidity_min is not None and humidity_max is not None and humidity_min > humidity_max:
+        raise HTTPException(status_code=422, detail="humidity_min 不能大于 humidity_max")
+
+    out = services.build_case_excursions(
+        db, device_sn, start_utc, end_utc, thresholds, max_gap
+    )
+    if out is None:
+        raise HTTPException(status_code=404, detail="展柜不存在或尚无读数")
+    return out
 
 
 # ---------- 锚点校准 ----------

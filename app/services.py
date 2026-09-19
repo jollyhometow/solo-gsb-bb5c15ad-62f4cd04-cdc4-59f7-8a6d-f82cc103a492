@@ -8,11 +8,21 @@ from collections import defaultdict
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
+from . import excursions as exc
 from . import segmentation as seg
 from . import timeline as tl
 from .config import settings
 from .database import Anchor, CaseState, Reading, SegmentSnapshot, to_utc, utcnow
-from .schemas import AnchorIn, ReadingIn, SegmentOut, SegmentationOut, TimelineOut, TimelinePointOut
+from .schemas import (
+    AnchorIn,
+    ExcursionEventOut,
+    ExcursionsOut,
+    ReadingIn,
+    SegmentOut,
+    SegmentationOut,
+    TimelineOut,
+    TimelinePointOut,
+)
 
 
 # ---------- 读取 / 序列化 ----------
@@ -441,6 +451,61 @@ def build_case_timeline(
                 reasons=reasons,
             )
             for i, reasons in chosen
+        ],
+    )
+
+
+# ---------- 越界剂量 ----------
+
+
+def build_case_excursions(
+    db: Session,
+    device_sn: str,
+    start: dt.datetime | None,
+    end: dt.datetime | None,
+    thresholds: exc.Thresholds,
+    max_gap_seconds: float,
+) -> ExcursionsOut | None:
+    """越界剂量事件（只读计算，不落库）。
+
+    设备没有任何读数时返回 ``None``（由上层判 404）；有读数但过滤后
+    为空范围时返回空事件列表。剂量只基于过滤后范围内的分段线性曲线。
+    """
+    all_samples = _load_samples(db, device_sn)
+    if not all_samples:
+        return None
+    samples = all_samples
+    if start is not None:
+        samples = [s for s in samples if s.ts >= start]
+    if end is not None:
+        samples = [s for s in samples if s.ts <= end]
+
+    events = exc.compute_excursions(samples, thresholds, max_gap_seconds)
+    return ExcursionsOut(
+        device_sn=device_sn,
+        start=start,
+        end=end,
+        max_gap_seconds=max_gap_seconds,
+        temp_min=thresholds.temp_min,
+        temp_max=thresholds.temp_max,
+        humidity_min=thresholds.humidity_min,
+        humidity_max=thresholds.humidity_max,
+        sample_count=len(samples),
+        event_count=len(events),
+        events=[
+            ExcursionEventOut(
+                start_ts=e.start_ts,
+                end_ts=e.end_ts,
+                dimensions=list(e.dimensions),
+                duration_seconds=e.duration_seconds,
+                temp_dose=e.temp_dose,
+                humidity_dose=e.humidity_dose,
+                peak_temperature=e.peak_temperature,
+                peak_temperature_ts=e.peak_temperature_ts,
+                peak_humidity=e.peak_humidity,
+                peak_humidity_ts=e.peak_humidity_ts,
+            )
+            for e in events
         ],
     )
 

@@ -3,7 +3,8 @@
 基于 **FastAPI + SQLite + SQLAlchemy 2.0** 的展柜温湿度变点（change point）
 分析服务。客户端按 **设备序号 + 时间戳** 批量上报温度、湿度读数；服务对每个
 展柜独立执行**带惩罚项的确定性变点分段**，自动合并同序号重复上报，支持迟到
-读数补入后的时间线重放、锚点校准与“不落库”的重放预览。
+读数补入后的时间线重放、锚点校准与“不落库”的重放预览；并提供基于
+**线性插值阈值交点**的越界剂量（excursion dose）事件查询。
 
 ---
 
@@ -87,6 +88,20 @@ new_mean = (old_mean × report_count + value) / (report_count + 1)
 **内存副本**上合并。整个请求只执行只读查询，不写入任何表、不推进版本号、
 不产生副作用。
 
+### 6. 越界剂量事件
+
+`GET /api/v1/cases/{sn}/excursions` 把读数视为**分段线性**曲线，对温度、湿度
+分别求出超出上下限的部分并**随时间积分**（剂量：温度 °C·秒、湿度 %RH·秒）：
+
+- 阈值交点按相邻读数**线性插值精确求出**，不做阶梯近似；等于阈值不算越界。
+- 相邻读数间隔**大于** `max_gap` 时曲线断开，未知区间**不计剂量**
+  （恰好等于 `max_gap` 仍视为连续）；孤立高读数两侧曲线未知时不产生事件。
+- 任一维度越界的**连续区间合并为事件**，返回起止时间、触发维度、峰值
+  （越界幅度最大处的读数值，并列取最早）、持续秒数与各维累计剂量，
+  事件按开始时间稳定排序。
+- 至少需配置一个上下限；`temp_min > temp_max`、`humidity_min > humidity_max`、
+  `start > end`、`max_gap ≤ 0` 均返回 `422`。
+
 ---
 
 ## 接口一览
@@ -97,6 +112,7 @@ new_mean = (old_mean × report_count + value) / (report_count + 1)
 | GET  | `/api/v1/cases` | 展柜列表（版本、读数/锚点数） |
 | GET  | `/api/v1/cases/{sn}/segments` | 查询分段，支持 `start` / `end` 时间过滤 |
 | GET  | `/api/v1/cases/{sn}/timeline?max_points=...` | 时间线降采样读数，支持 `start` / `end` 时间过滤 |
+| GET  | `/api/v1/cases/{sn}/excursions` | 越界剂量事件：线性插值交点、分维剂量积分、`max_gap` 断开 |
 | POST | `/api/v1/anchors` | 登记/更新锚点并重放 |
 | GET  | `/api/v1/cases/{sn}/anchors` | 查询锚点及对齐情况 |
 | DELETE | `/api/v1/cases/{sn}/anchors/{ts}` | 删除锚点并重放 |
@@ -195,6 +211,56 @@ curl 'http://localhost:8080/api/v1/cases/CASE-007/timeline?max_points=200&start=
             "minimum_required": 8, "max_points": 5}}
 ```
 
+### 越界剂量查询
+
+```bash
+curl 'http://localhost:8080/api/v1/cases/CASE-007/excursions?temp_max=26&humidity_max=65&max_gap=600&start=2026-09-01T00:00:00Z&end=2026-09-02T00:00:00Z'
+```
+
+| 参数 | 默认 | 说明 |
+| --- | --- | --- |
+| `start` / `end` | 不限 | 含端点的 ISO8601 过滤；剂量只基于过滤后范围内的分段线性曲线 |
+| `temp_min` / `temp_max` | 不限 | 温度下/上限（°C，−50…100） |
+| `humidity_min` / `humidity_max` | 不限 | 湿度下/上限（%RH，0…100） |
+| `max_gap` | `600` | 允许的最大采样间隔（秒，0 < x ≤ 86400）；超过则断开，未知区间不计剂量 |
+
+四个上下限至少配置一个，否则返回 `422`；同一维度的下限大于上限、
+`start` 晚于 `end`、`max_gap` 非正数同样返回 `422`。设备没有读数返回 `404`，
+过滤后为空范围返回 `200` 与空事件列表。
+
+响应示例（温度、湿度越界区间重叠，合并为一个事件）：
+
+```json
+{
+  "device_sn": "CASE-007",
+  "start": "2026-09-01T00:00:00Z",
+  "end": "2026-09-02T00:00:00Z",
+  "max_gap_seconds": 600.0,
+  "temp_min": null, "temp_max": 26.0,
+  "humidity_min": null, "humidity_max": 65.0,
+  "sample_count": 4,
+  "event_count": 1,
+  "events": [
+    {
+      "start_ts": "2026-09-01T00:00:00Z",
+      "end_ts": "2026-09-01T00:30:00Z",
+      "dimensions": ["temperature", "humidity"],
+      "duration_seconds": 1800.0,
+      "temp_dose": 6750.0,
+      "humidity_dose": 13500.0,
+      "peak_temperature": 30.0,
+      "peak_temperature_ts": "2026-09-01T00:00:00Z",
+      "peak_humidity": 70.0,
+      "peak_humidity_ts": "2026-09-01T00:10:00Z"
+    }
+  ]
+}
+```
+
+起止时间为线性插值得到的**精确阈值交点**（落在读数之间）；`temp_dose` /
+`humidity_dose` 为事件内各维越界幅度对时间的累计积分；未触发某维度时对应
+剂量为 `0`、峰值字段为 `null`。
+
 ---
 
 ## 配置（环境变量）
@@ -223,6 +289,8 @@ python -m pytest -q
 
 测试覆盖：变点检出与置信标记、惩罚项单调性、确定性、重复合并、迟到重放、
 锚点强制边界、时间范围查询、**预览不写库**（含待预览读数与库内重复、
-请求内时间戳重复时在内存副本上按 `report_count` 累计均值的回归用例），以及
+请求内时间戳重复时在内存副本上按 `report_count` 累计均值的回归用例），
 **时间线降采样**（比例配额与余数稳定分派、强制点去重超预算返回 422 与
-`minimum_required`、确定性 LTTB、`start` / `end` 过滤后的极值与预算）。
+`minimum_required`、确定性 LTTB、`start` / `end` 过滤后的极值与预算），以及
+**越界剂量**（线性插值交点精确性、三角/矩形剂量积分、`max_gap` 断开与未知
+区间剔除、跨维度事件合并、参数校验 422 与空范围/未知设备）。
