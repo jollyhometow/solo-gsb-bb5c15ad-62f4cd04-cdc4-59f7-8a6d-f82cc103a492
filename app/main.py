@@ -17,6 +17,7 @@ from .schemas import (
     AnchorOut,
     BatchIngest,
     CaseOut,
+    ExcursionResponse,
     HealthOut,
     IngestResponse,
     IngestSummary,
@@ -220,8 +221,55 @@ def get_timeline(
     return timeline
 
 
-# ---------- 锚点校准 ----------
+# ---------- 越界剂量查询 ----------
 
+
+@app.get(
+    "/api/v1/cases/{device_sn}/excursions",
+    response_model=ExcursionResponse,
+    tags=["cases"],
+    summary="查询越界事件与温/湿度超限剂量（相邻读数线性插值，精确求阈值交点）",
+)
+def get_excursions(
+    device_sn: str,
+    start: dt.datetime | None = Query(None, description="起始时间（含），ISO8601"),
+    end: dt.datetime | None = Query(None, description="结束时间（含），ISO8601"),
+    temp_min: float | None = Query(None, ge=-50.0, le=100.0, description="温度下限（°C），越下限计入剂量"),
+    temp_max: float | None = Query(None, ge=-50.0, le=100.0, description="温度上限（°C），越上限计入剂量"),
+    hum_min: float | None = Query(None, ge=0.0, le=100.0, description="湿度下限（%RH），越下限计入剂量"),
+    hum_max: float | None = Query(None, ge=0.0, le=100.0, description="湿度上限（%RH），越上限计入剂量"),
+    max_gap: float = Query(
+        ...,
+        gt=0.0,
+        le=31_622_400.0,
+        description="相邻读数最大允许采样间隔（秒）；严格超过该间隔必须断开，未知区间不计剂量",
+    ),
+    db: Session = Depends(get_db),
+):
+    start_utc = _parse_ts(start)
+    end_utc = _parse_ts(end)
+    if start_utc is not None and end_utc is not None and start_utc > end_utc:
+        raise HTTPException(status_code=422, detail="start 不能晚于 end")
+
+    # 至少配置一个有效上下限（温度或湿度均可）
+    bounds = (temp_min, temp_max, hum_min, hum_max)
+    if all(v is None for v in bounds):
+        raise HTTPException(status_code=422, detail="至少需要提供一个阈值：temp_min/temp_max/hum_min/hum_max")
+    if temp_min is not None and temp_max is not None and temp_min > temp_max:
+        raise HTTPException(status_code=422, detail="temp_min 不能大于 temp_max")
+    if hum_min is not None and hum_max is not None and hum_min > hum_max:
+        raise HTTPException(status_code=422, detail="hum_min 不能大于 hum_max")
+
+    result = services.build_case_excursions(
+        db, device_sn, start_utc, end_utc,
+        temp_min, temp_max, hum_min, hum_max, max_gap,
+    )
+    if result is None:
+        raise HTTPException(status_code=404, detail="展柜不存在或尚无读数")
+    return result
+
+
+# ---------- 锚点校准 ----------
 
 @app.post(
     "/api/v1/anchors",

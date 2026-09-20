@@ -8,6 +8,7 @@ from typing import Literal
 from pydantic import BaseModel, Field, field_validator
 
 Confidence = Literal["baseline", "high", "medium", "low"]
+ExcursionDimension = Literal["temperature", "humidity"]
 
 
 def _to_utc(value: dt.datetime) -> dt.datetime:
@@ -159,6 +160,48 @@ class TimelineOut(BaseModel):
     original_count: int = Field(..., description="过滤后、降采样前的读数数量")
     returned_count: int
     points: list[TimelinePointOut]
+
+
+class ExcursionOut(BaseModel):
+    index: int = Field(..., description="事件序号，从 0 开始，按开始时间升序")
+    start_ts: dt.datetime = Field(..., description="越界起始时刻（阈值插值交点，UTC）")
+    end_ts: dt.datetime = Field(..., description="越界结束时刻（阈值插值交点，UTC）")
+    duration_seconds: float = Field(..., description="事件持续秒数（end_ts - start_ts）")
+    dimensions: list[ExcursionDimension] = Field(
+        ..., description="触发维度，固定按 temperature、humidity 顺序排列"
+    )
+    peak_temperature: float | None = Field(
+        None, description="事件期间温度最大越限点的实际温度读数（°C）；温度未越界为 null"
+    )
+    peak_humidity: float | None = Field(
+        None, description="事件期间湿度最大越限点的实际湿度读数（%RH）；湿度未越界为 null"
+    )
+    temperature_peak_excess: float = Field(
+        ..., description="温度相对最近阈值的最大越限幅度（°C，非负）"
+    )
+    humidity_peak_excess: float = Field(
+        ..., description="湿度相对最近阈值的最大越限幅度（%RH，非负）"
+    )
+    temperature_dose: float = Field(
+        ..., description="温度超限幅度对时间的累计积分（°C·秒）"
+    )
+    humidity_dose: float = Field(
+        ..., description="湿度超限幅度对时间的累计积分（%RH·秒）"
+    )
+
+
+class ExcursionResponse(BaseModel):
+    device_sn: str
+    start: dt.datetime | None = Field(None, description="实际生效的起始过滤（UTC），未指定为 null")
+    end: dt.datetime | None = Field(None, description="实际生效的结束过滤（UTC），未指定为 null")
+    temp_min: float | None
+    temp_max: float | None
+    hum_min: float | None
+    hum_max: float | None
+    max_gap: float = Field(..., description="相邻读数最大允许采样间隔（秒，超过即断开）")
+    sample_count: int = Field(..., description="时间窗口内参与分析的读数数量")
+    event_count: int
+    events: list[ExcursionOut]
 
 
 class HealthOut(BaseModel):

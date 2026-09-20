@@ -673,6 +673,186 @@ def test_timeline_deterministic(client):
     ]
 
 
+# ---------- 越界剂量查询 ----------
+
+
+def _excursion_payload(sn):
+    # 每 10 分钟一点；温度在 00~40 越上限（22），中间有一次 120 分钟大空档
+    # 00:00→00:30 温度 20→22，湿度平稳；02:30→03:00 温度回落到 20、湿度冲顶
+    return [
+        _reading(sn, "2026-09-01T08:00:00+08:00", 20.0, 55.0),
+        _reading(sn, "2026-09-01T08:10:00+08:00", 21.0, 55.0),
+        _reading(sn, "2026-09-01T08:20:00+08:00", 22.0, 55.0),
+        _reading(sn, "2026-09-01T08:30:00+08:00", 22.0, 55.0),
+        # 120 分钟空档
+        _reading(sn, "2026-09-01T10:30:00+08:00", 22.0, 55.0),
+        _reading(sn, "2026-09-01T10:40:00+08:00", 21.0, 55.0),
+        _reading(sn, "2026-09-01T10:50:00+08:00", 20.0, 55.0),
+        _reading(sn, "2026-09-01T11:00:00+08:00", 20.0, 75.0),
+        _reading(sn, "2026-09-01T11:10:00+08:00", 20.0, 55.0),
+    ]
+
+
+def test_excursions_basic_dose_and_events(client):
+    client.post("/api/v1/readings/batch", json={"readings": _excursion_payload("CASE-E0")})
+    r = client.get("/api/v1/cases/CASE-E0/excursions", params={
+        "temp_max": 21.0, "hum_max": 65.0, "max_gap": 1800,
+    })
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["device_sn"] == "CASE-E0"
+    assert body["sample_count"] == 9
+    assert body["event_count"] == 3
+
+    # 事件 1：温度越上限（08:00~08:30），08:30→10:30 的 120 分钟空档断开
+    e0 = body["events"][0]
+    assert e0["dimensions"] == ["temperature"]
+    # 20→21 段恰好 21 为阈值：真正交点在 21→22 的 08:10→08:20
+    assert e0["start_ts"].startswith("2026-09-01T00:10:00")
+    assert e0["end_ts"].startswith("2026-09-01T00:30:00")
+    # 21→22 三角形 (0+1)/2*600=300；22 平顶 1*600=600 → 900
+    assert e0["temperature_dose"] == pytest.approx(900.0)
+    assert e0["peak_temperature"] == 22.0
+    assert e0["temperature_peak_excess"] == pytest.approx(1.0)
+    assert e0["peak_humidity"] is None
+
+    # 事件 2：空档之后温度 22→21 的回落段（10:30~10:40）
+    e1 = body["events"][1]
+    assert e1["dimensions"] == ["temperature"]
+    assert e1["start_ts"].startswith("2026-09-01T02:30:00")
+    assert e1["end_ts"].startswith("2026-09-01T02:40:00")
+    assert e1["temperature_dose"] == pytest.approx(300.0)  # (1+0)/2*600
+
+    # 事件 3：湿度 55→75→55，阈值 65 交点 10:55 与 11:05
+    e2 = body["events"][2]
+    assert e2["dimensions"] == ["humidity"]
+    assert e2["start_ts"].startswith("2026-09-01T02:55:00")
+    assert e2["end_ts"].startswith("2026-09-01T03:05:00")
+    assert e2["peak_humidity"] == 75.0
+    assert e2["humidity_peak_excess"] == pytest.approx(10.0)
+    # 上升三角形 (0+10)/2*300=1500；下降三角形 (10+0)/2*300=1500
+    assert e2["humidity_dose"] == pytest.approx(3000.0)
+    assert e2["peak_temperature"] is None
+
+
+def test_excursions_gap_boundary_equal_vs_exceed(client):
+    client.post("/api/v1/readings/batch", json={"readings": _excursion_payload("CASE-E1")})
+    # max_gap = 7200：120 分钟空档恰好不超限，空档插值恒定 22，温度事件连成一片
+    r = client.get("/api/v1/cases/CASE-E1/excursions", params={
+        "temp_max": 21.0, "max_gap": 7200,
+    })
+    assert r.status_code == 200, r.text
+    body = r.json()
+    temp_events = [e for e in body["events"] if "temperature" in e["dimensions"]]
+    assert len(temp_events) == 1
+    assert temp_events[0]["start_ts"].startswith("2026-09-01T00:10:00")
+    assert temp_events[0]["end_ts"].startswith("2026-09-01T02:40:00")
+    # 900（首段）+ 1*7200（空档矩形）+ 300（回落三角形）= 8400
+    assert temp_events[0]["temperature_dose"] == pytest.approx(8400.0)
+
+
+def test_excursions_validation_requires_at_least_one_bound(client):
+    client.post("/api/v1/readings/batch", json={"readings": _excursion_payload("CASE-E2")})
+    r = client.get("/api/v1/cases/CASE-E2/excursions", params={"max_gap": 1800})
+    assert r.status_code == 422
+
+    # max_gap 必填
+    r = client.get("/api/v1/cases/CASE-E2/excursions", params={"temp_max": 21.0})
+    assert r.status_code == 422
+
+    # max_gap 必须为正
+    r = client.get("/api/v1/cases/CASE-E2/excursions",
+                   params={"temp_max": 21.0, "max_gap": 0})
+    assert r.status_code == 422
+
+    # 下限不能大于上限
+    r = client.get("/api/v1/cases/CASE-E2/excursions", params={
+        "temp_min": 25.0, "temp_max": 21.0, "max_gap": 1800,
+    })
+    assert r.status_code == 422
+    assert "temp_min" in r.json()["detail"]
+
+    r = client.get("/api/v1/cases/CASE-E2/excursions", params={
+        "hum_min": 80.0, "hum_max": 60.0, "max_gap": 1800,
+    })
+    assert r.status_code == 422
+    assert "hum_min" in r.json()["detail"]
+
+    # start 晚于 end
+    r = client.get("/api/v1/cases/CASE-E2/excursions", params={
+        "temp_max": 21.0, "max_gap": 1800,
+        "start": "2026-10-01T00:00:00Z", "end": "2026-09-01T00:00:00Z",
+    })
+    assert r.status_code == 422
+
+
+def test_excursions_threshold_physical_range_validation(client):
+    client.post("/api/v1/readings/batch", json={"readings": _excursion_payload("CASE-E3")})
+    # 超出物理量程（温度 -50~100，湿度 0~100）→ FastAPI 422
+    r = client.get("/api/v1/cases/CASE-E3/excursions",
+                   params={"temp_max": 999.0, "max_gap": 1800})
+    assert r.status_code == 422
+    r = client.get("/api/v1/cases/CASE-E3/excursions",
+                   params={"hum_min": -1.0, "max_gap": 1800})
+    assert r.status_code == 422
+
+
+def test_excursions_unknown_case_404(client):
+    r = client.get("/api/v1/cases/NOPE/excursions",
+                   params={"temp_max": 21.0, "max_gap": 1800})
+    assert r.status_code == 404
+
+
+def test_excursions_time_window_filter(client):
+    client.post("/api/v1/readings/batch", json={"readings": _excursion_payload("CASE-E4")})
+    # 只查 10:00 之后：早段温度事件被窗口排除
+    r = client.get("/api/v1/cases/CASE-E4/excursions", params={
+        "temp_max": 21.0, "hum_max": 65.0, "max_gap": 1800,
+        "start": "2026-09-01T10:00:00+08:00",
+        "end": "2026-09-01T12:00:00+08:00",
+    })
+    assert r.status_code == 200, r.text
+    body = r.json()
+    # 窗口含 10:30/10:40/10:50/11:00/11:10 共 5 点
+    assert body["sample_count"] == 5
+    # 窗口内同时存在温度回落段（02:30~02:40）与湿度峰值事件
+    dims = [d for e in body["events"] for d in e["dimensions"]]
+    assert "humidity" in dims
+    assert "temperature" in dims
+    assert all(e["start_ts"] >= "2026-09-01T02:00:00Z" for e in body["events"])
+
+
+def test_excursions_empty_window_returns_empty(client):
+    client.post("/api/v1/readings/batch", json={"readings": _excursion_payload("CASE-E5")})
+    r = client.get("/api/v1/cases/CASE-E5/excursions", params={
+        "temp_max": 21.0, "max_gap": 1800,
+        "start": "2030-01-01T00:00:00Z", "end": "2030-02-01T00:00:00Z",
+    })
+    assert r.status_code == 200
+    body = r.json()
+    assert body["events"] == []
+    assert body["event_count"] == 0
+    assert body["sample_count"] == 0
+
+
+def test_excursions_deterministic(client):
+    payload = _excursion_payload("CASE-E6")
+    client.post("/api/v1/readings/batch", json={"readings": payload})
+    params = {"temp_min": 18.0, "temp_max": 21.0, "hum_max": 65.0, "max_gap": 1800}
+    first = client.get("/api/v1/cases/CASE-E6/excursions", params=params).json()
+    second = client.get("/api/v1/cases/CASE-E6/excursions", params=params).json()
+    assert first == second
+
+
+def test_excursions_events_sorted_by_start(client):
+    client.post("/api/v1/readings/batch", json={"readings": _excursion_payload("CASE-E7")})
+    r = client.get("/api/v1/cases/CASE-E7/excursions", params={
+        "temp_max": 21.0, "hum_max": 65.0, "max_gap": 1800,
+    })
+    starts = [e["start_ts"] for e in r.json()["events"]]
+    assert starts == sorted(starts)
+
+
 def test_timeline_without_prior_replay_uses_on_demand_segmentation(client):
     # 关闭自动重放：落库但没有分段快照，timeline 仍应即时计算分段边界
     r = client.post(

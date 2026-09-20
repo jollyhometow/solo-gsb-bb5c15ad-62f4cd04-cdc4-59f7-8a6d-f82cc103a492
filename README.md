@@ -97,6 +97,7 @@ new_mean = (old_mean × report_count + value) / (report_count + 1)
 | GET  | `/api/v1/cases` | 展柜列表（版本、读数/锚点数） |
 | GET  | `/api/v1/cases/{sn}/segments` | 查询分段，支持 `start` / `end` 时间过滤 |
 | GET  | `/api/v1/cases/{sn}/timeline?max_points=...` | 时间线降采样读数，支持 `start` / `end` 时间过滤 |
+| GET  | `/api/v1/cases/{sn}/excursions` | 越界事件与温/湿度超限剂量（线性插值精确积分），支持时间范围与 `max_gap` |
 | POST | `/api/v1/anchors` | 登记/更新锚点并重放 |
 | GET  | `/api/v1/cases/{sn}/anchors` | 查询锚点及对齐情况 |
 | DELETE | `/api/v1/cases/{sn}/anchors/{ts}` | 删除锚点并重放 |
@@ -195,6 +196,69 @@ curl 'http://localhost:8080/api/v1/cases/CASE-007/timeline?max_points=200&start=
             "minimum_required": 8, "max_points": 5}}
 ```
 
+### 越界事件与剂量查询
+
+```bash
+curl 'http://localhost:8080/api/v1/cases/CASE-007/excursions?start=2026-09-01T00:00:00Z&end=2026-09-02T00:00:00Z&temp_min=15&temp_max=22&hum_min=45&hum_max=65&max_gap=1800'
+```
+
+查询参数（`start` / `end` 可选，为含端点的 ISO8601 过滤；`max_gap` 必填、单位秒）：
+
+| 参数 | 含义 |
+| --- | --- |
+| `temp_min` / `temp_max` | 温度下限 / 上限（°C，物理范围 -50~100） |
+| `hum_min` / `hum_max` | 湿度下限 / 上限（%RH，物理范围 0~100） |
+| `max_gap` | 相邻读数最大允许采样间隔（秒，> 0） |
+
+四个阈值**至少提供一个**；同一维度 `min > max`、`start > end` 均返回 `422`。
+
+计算规则：
+
+1. 相邻读数之间对温度、湿度分别做**线性插值**，与每个已配置阈值的交点
+   **精确求解**（不以采样点近似）；越限幅度（高于上限 / 低于下限的差值）
+   对时间积分，得到温度剂量（°C·秒）与湿度剂量（%RH·秒）。
+2. 相邻读数间隔**严格超过** `max_gap` 秒时必须断开：两点之间不插值，
+   断开的未知区间**不计剂量**、也不跨空档合并事件（间隔恰好等于
+   `max_gap` 仍视为连续）。
+3. 温度、湿度各自的越限连续区间生成后，把**任一维度**越限且相交或
+   首尾相接的区间合并为一个事件。事件按开始时间**稳定排序**。
+
+每个事件返回：`start_ts` / `end_ts`（阈值交点时刻）、`duration_seconds`、
+`dimensions`（触发维度，固定按 `temperature`、`humidity` 排序）、
+`peak_temperature` / `peak_humidity`（该维度未越界时为 `null`）及对应
+最大越限幅度、`temperature_dose` / `humidity_dose` 累计剂量。设备没有
+任何读数时返回 `404`；窗口内无越界时返回 `200` 与空事件数组。
+
+响应示例（节选）：
+
+```json
+{
+  "device_sn": "CASE-007",
+  "start": "2026-09-01T00:00:00Z",
+  "end": "2026-09-02T00:00:00Z",
+  "temp_min": 15.0, "temp_max": 22.0,
+  "hum_min": 45.0, "hum_max": 65.0,
+  "max_gap": 1800.0,
+  "sample_count": 144,
+  "event_count": 1,
+  "events": [
+    {
+      "index": 0,
+      "start_ts": "2026-09-01T00:07:30Z",
+      "end_ts": "2026-09-01T00:42:00Z",
+      "duration_seconds": 2070.0,
+      "dimensions": ["temperature", "humidity"],
+      "peak_temperature": 23.4,
+      "peak_humidity": 71.0,
+      "temperature_peak_excess": 1.4,
+      "humidity_peak_excess": 6.0,
+      "temperature_dose": 912.5,
+      "humidity_dose": 3825.0
+    }
+  ]
+}
+```
+
 ---
 
 ## 配置（环境变量）
@@ -223,6 +287,10 @@ python -m pytest -q
 
 测试覆盖：变点检出与置信标记、惩罚项单调性、确定性、重复合并、迟到重放、
 锚点强制边界、时间范围查询、**预览不写库**（含待预览读数与库内重复、
-请求内时间戳重复时在内存副本上按 `report_count` 累计均值的回归用例），以及
+请求内时间戳重复时在内存副本上按 `report_count` 累计均值的回归用例），
 **时间线降采样**（比例配额与余数稳定分派、强制点去重超预算返回 422 与
-`minimum_required`、确定性 LTTB、`start` / `end` 过滤后的极值与预算）。
+`minimum_required`、确定性 LTTB、`start` / `end` 过滤后的极值与预算），以及
+**越界剂量**（线性插值精确交点与梯形积分、上下限同向配置、`max_gap`
+严格超限断开且未知区间不计剂量、间隔恰好等于 `max_gap` 连续、温/湿度
+相交与首尾相接区间合并、按开始时间稳定排序、至少一个阈值与物理量程等
+边界校验）。

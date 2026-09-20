@@ -8,11 +8,21 @@ from collections import defaultdict
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
+from . import excursions as ex
 from . import segmentation as seg
 from . import timeline as tl
 from .config import settings
 from .database import Anchor, CaseState, Reading, SegmentSnapshot, to_utc, utcnow
-from .schemas import AnchorIn, ReadingIn, SegmentOut, SegmentationOut, TimelineOut, TimelinePointOut
+from .schemas import (
+    AnchorIn,
+    ExcursionOut,
+    ExcursionResponse,
+    ReadingIn,
+    SegmentOut,
+    SegmentationOut,
+    TimelineOut,
+    TimelinePointOut,
+)
 
 
 # ---------- 读取 / 序列化 ----------
@@ -441,6 +451,71 @@ def build_case_timeline(
                 reasons=reasons,
             )
             for i, reasons in chosen
+        ],
+    )
+
+
+# ---------- 越界剂量 ----------
+
+
+def build_case_excursions(
+    db: Session,
+    device_sn: str,
+    start: dt.datetime | None,
+    end: dt.datetime | None,
+    temp_min: float | None,
+    temp_max: float | None,
+    hum_min: float | None,
+    hum_max: float | None,
+    max_gap: float,
+) -> ExcursionResponse | None:
+    """加载窗口内读数并执行越界剂量分析（只读，不落库）。
+
+    设备没有任何读数时返回 ``None``（由上层判 404）；有读数但窗口内
+    为空时返回空事件列表。阈值交叉点由相邻读数线性插值精确求解，
+    采样间隔严格超过 ``max_gap`` 秒的读数对之间断开，不计未知区间。
+    """
+    all_samples = _load_samples(db, device_sn)
+    if not all_samples:
+        return None
+    samples = all_samples
+    if start is not None:
+        samples = [s for s in samples if s.ts >= start]
+    if end is not None:
+        samples = [s for s in samples if s.ts <= end]
+
+    events = ex.compute_excursions(
+        samples,
+        ex.Thresholds(low=temp_min, high=temp_max),
+        ex.Thresholds(low=hum_min, high=hum_max),
+        max_gap_seconds=max_gap,
+    )
+    return ExcursionResponse(
+        device_sn=device_sn,
+        start=start,
+        end=end,
+        temp_min=temp_min,
+        temp_max=temp_max,
+        hum_min=hum_min,
+        hum_max=hum_max,
+        max_gap=max_gap,
+        sample_count=len(samples),
+        event_count=len(events),
+        events=[
+            ExcursionOut(
+                index=e.index,
+                start_ts=e.start_ts,
+                end_ts=e.end_ts,
+                duration_seconds=e.duration_seconds,
+                dimensions=e.dimensions,
+                peak_temperature=e.peak_temperature,
+                peak_humidity=e.peak_humidity,
+                temperature_peak_excess=e.temperature_peak_excess,
+                humidity_peak_excess=e.humidity_peak_excess,
+                temperature_dose=e.temperature_dose,
+                humidity_dose=e.humidity_dose,
+            )
+            for e in events
         ],
     )
 
